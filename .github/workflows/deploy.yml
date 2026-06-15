@@ -1,0 +1,96 @@
+name: Deploy to Production
+
+on:
+  workflow_run:
+    workflows: ["Build Backend", "Build Frontend"]
+    types: [completed]
+    branches: [main]
+
+concurrency:
+  group: deploy-to-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: http://k8s-shopvers-shopvers-fd5bfe93ff-14920425.us-east-1.elb.amazonaws.com
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout shopverse-k8s
+        uses: actions/checkout@v4
+        with:
+          repository: EzzEldinAbdUlHafiz/shopverse-k8s
+          token: ${{ secrets.SHOPVERSE_K8S_PAT }}
+          path: shopverse-k8s
+
+      - name: Setup yq
+        uses: mikefarah/yq@v4.44.1
+
+      - name: Determine changed component and commit SHA
+        id: detect
+        run: |
+          TRIGGER_NAME="${{ github.event.workflow_run.name }}"
+          COMMIT_SHA="${{ github.event.workflow_run.head_sha }}"
+          echo "sha=$COMMIT_SHA" >> $GITHUB_OUTPUT
+          if [[ "$TRIGGER_NAME" == "Build Backend" ]]; then
+            echo "component=backend" >> $GITHUB_OUTPUT
+          elif [[ "$TRIGGER_NAME" == "Build Frontend" ]]; then
+            echo "component=frontend" >> $GITHUB_OUTPUT
+          else
+            echo "component=both" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Update image tags in Helm values
+        working-directory: shopverse-k8s
+        run: |
+          SHA="${{ steps.detect.outputs.sha }}"
+          COMPONENT="${{ steps.detect.outputs.component }}"
+          
+          # ── Adjust these yq paths to match your actual values.yaml structure ──
+          if [[ "$COMPONENT" == "backend" || "$COMPONENT" == "both" ]]; then
+            yq e ".backend.image.tag = \"$SHA\"" -i helm/shopverse/values.yaml
+          fi
+          if [[ "$COMPONENT" == "frontend" || "$COMPONENT" == "both" ]]; then
+            yq e ".frontend.image.tag = \"$SHA\"" -i helm/shopverse/values.yaml
+          fi
+          
+          cat helm/shopverse/values.yaml
+
+      - name: Commit and push updated values
+        working-directory: shopverse-k8s
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add helm/shopverse/values.yaml
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git commit -m "ci: update ${{ steps.detect.outputs.component }} image tag to ${{ steps.detect.outputs.sha }}"
+          git pull --rebase origin main || true
+          git push
+
+      - name: Install ArgoCD CLI
+        run: |
+          curl -sSL -o argocd-linux-amd64 https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          sudo install -m 555 argocd-linux-amd64 /usr/local/bin/argocd
+          rm argocd-linux-amd64
+
+      - name: Sync ArgoCD application
+        env:
+          ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+        run: |
+          if [[ -z "$ARGOCD_SERVER" || -z "$ARGOCD_AUTH_TOKEN" ]]; then
+            echo "ArgoCD credentials not configured. Skipping explicit sync."
+            echo "ArgoCD auto-sync will pick up the changes from shopverse-k8s."
+            exit 0
+          fi
+          argocd app sync shopverse \
+            --server "$ARGOCD_SERVER" \
+            --auth-token "$ARGOCD_AUTH_TOKEN" \
+            --prune
